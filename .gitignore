@@ -43,6 +43,7 @@ htmlcov/
 
 # --- Konfiguration / Secrets ---
 AGENTS.md
+TODO.md
 .env
 .env.*
 !.env.example
