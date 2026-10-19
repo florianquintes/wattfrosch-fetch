@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout wattfrosch-fetch
+        uses: actions/checkout@v4
+        with:
+          path: wattfrosch-fetch
+
+      - name: Checkout wattfrosch-contracts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/wattfrosch-contracts
+          ref: v0.1.0
+          path: wattfrosch-contracts
+          token: ${{ secrets.CONTRACTS_READ_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: wattfrosch-fetch/uv.lock
+
+      - name: Sync dependencies
+        working-directory: wattfrosch-fetch
+        run: uv sync --locked
+
+      - name: Lint
+        working-directory: wattfrosch-fetch
+        run: uv run ruff check .
+
+      - name: Type check
+        working-directory: wattfrosch-fetch
+        run: uv run pyrefly check
+
+      - name: Run tests
+        working-directory: wattfrosch-fetch
+        run: uv run pytest
