@@ -77,10 +77,55 @@ uv run wattfrosch-fetch --help
 - Tests grün (mit gemockten Antworten)
 - Dockerfile baut
 
+## Quellenrollen und Fehlerverhalten
+Alle Quellen sind gleichrangig: `--source` entscheidet immer explizit; es
+gibt keine bevorzugte Quelle und kein stilles Ausweichen auf eine andere
+Quelle. Eine Metrik/Region-Kombination, die die gewählte Quelle nicht
+abdeckt, ist ein Konfigurationsfehler. `generation.oil` ist in v1
+ausschließlich über energy-charts verfügbar — SMARD hat keinen dokumentierten
+Filter dafür, und fetch erfindet keinen. Ein Alternativ-Provider wäre eine
+neue Quelle im Contract (SOURCES/SOURCE_METRIC_MAP), kein Fetch-Workaround.
+
+Fehler-/Teilausfall-Verhalten: Schlägt die Quelle fehl, schlägt der ganze
+Lauf fehl — kein Überspringen mit Warnung. Lücken füllt transform;
+Wiederholungsläufe sind idempotent (der Store dedupliziert per
+`ON CONFLICT`).
+
+Exit-Codes des CLI:
+- 0: Erfolg
+- 1: Konfigurations-/Usage-Fehler (unbekannte Quelle/Metrik/Region, Metrik
+  nicht durch die Quelle abgedeckt, derived-Metrik angefragt, Region im
+  Zeitfenster ungültig, ungültiges Format)
+- 2: HTTP-/Transportfehler nach ausgeschöpften Retries (4xx/5xx, Timeout,
+  Rate-Limit)
+- 3: Response-Validierungsfehler (API-Abweichung, strikter
+  Validierungs-Hook)
+- Ein leeres Ergebnis ist kein Fehler: Exit 0 mit Warnung auf stderr
+  (Lücken füllt transform).
+
+## Paginierung und Fensteraufteilung
+Die einheitliche Abrufsignatur bleibt `fetch_series(metric, region, start,
+end)`; das Batching mehrerer Metriken pro HTTP-Request passiert intern im
+Client.
+
+- **Open-Meteo**: keine Paginierung. Ein Request pro (Region, Fenster) über
+  `start_date`/`end_date`; alle angefragten stündlichen Variablen werden in
+  einem Call gebündelt (`hourly=a,b,c`). Kein clientseitiges Zerlegen des
+  Fensters in v1 (Payloads sind klein).
+- **Energy-Charts**: keine Paginierung. Ein Request pro (Region, Fenster)
+  über `start`/`end` (ISO 8601 oder Unix-Sekunden); `/public_power` liefert
+  alle Erzeugungs-/Verbrauchsarten in einem Call und wird intern je Metrik
+  aufgeteilt. Rate-Limit: 2 Requests/Minute pro Client-IP und Endpunkt
+  (`/price` Burst 2); bei 429 wird `Retry-After` berücksichtigt. Kein
+  clientseitiges Zerlegen des Fensters in v1.
+- **SMARD**: implizite Paginierung in zwei Schritten — erst
+  `index_{resolution}.json` je (Filter, Region) abrufen, dann die
+  Wochentimestamps wählen, die `[start, end)` schneiden, und je Bucket einen
+  Request stellen. Pfad-Quirk: `filterCopy`/`regionCopy` müssen die
+  Pfad-Parameter wiederholen.
+
+Ein leeres Ergebnis (z. B. Energy-Charts 404 „keine Daten im Zeitraum") ist
+kein Fehler: Exit 0 mit Warnung auf stderr.
+
 ## Offene Punkte (mit OpenCode erarbeiten)
-- Welche Quellen zuerst, welche optional?
-- Caching-Strategie?
-- Fehler-/Teilausfall-Verhalten pro Quelle?
-- Wie oft sind Antworten paginiert, und wie wird paginiert?
-- Umgang mit generation.oil: gar nicht anbieten (smard-Lücke) oder später über
-  eine weitere Quelle beziehen?
+- (aktuell keine — alle Milestone-0-Entscheidungen sind getroffen)
