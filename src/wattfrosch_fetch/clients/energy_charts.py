@@ -56,6 +56,7 @@ from wattfrosch_fetch.http import (
     FetchSettings,
     FetchValidationError,
 )
+from wattfrosch_fetch.validity import clamp_to_validity
 
 SOURCE: Final[str] = "energy-charts"
 
@@ -203,7 +204,7 @@ class EnergyChartsClient(BaseClient):
     ) -> Iterable[MeasurementRecord]:
         """Fetch ``[start, end)`` as hourly records (PT1H, contract units)."""
         self._validate_request(metric, region, start, end)
-        window_start, window_end = self._clamp_to_validity(region, start, end)
+        window_start, window_end = clamp_to_validity(region, start, end)
         if window_start >= window_end:
             return iter(())
 
@@ -288,28 +289,6 @@ class EnergyChartsClient(BaseClient):
                 f"start {start.isoformat()} must be before end {end.isoformat()} "
                 "(half-open [start, end))"
             )
-
-    def _clamp_to_validity(
-        self,
-        region: str,
-        start: datetime,
-        end: datetime,
-    ) -> tuple[datetime, datetime]:
-        """Intersect the window with the region validity range.
-
-        The API ignores validity windows (serves pre-2018 data under
-        ``de-lu``), so the client clamps: only ``ts_utc`` where the region
-        is valid are emitted. A window fully outside the validity range
-        yields an empty result without a request.
-        """
-        entry = REGIONS[region]
-        valid_from = datetime.combine(entry.valid_from, datetime.min.time(), tzinfo=UTC)
-        clamped_start = max(start, valid_from)
-        clamped_end = end
-        if entry.valid_to is not None:
-            valid_to = datetime.combine(entry.valid_to, datetime.min.time(), tzinfo=UTC)
-            clamped_end = min(end, valid_to)
-        return clamped_start, clamped_end
 
     def _get_json_memoized(
         self,

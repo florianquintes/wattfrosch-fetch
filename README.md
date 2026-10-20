@@ -128,7 +128,16 @@ Client.
   `index_{resolution}.json` je (Filter, Region) abrufen, dann die
   Wochentimestamps wählen, die `[start, end)` schneiden, und je Bucket einen
   Request stellen. Pfad-Quirk: `filterCopy`/`regionCopy` müssen die
-  Pfad-Parameter wiederholen.
+  Pfad-Parameter wiederholen. Quirks: Bucket-Grenzen sind Berlin-lokale
+  Mitternächte (Epoch-ms bleiben absolut → für die Zeilen irrelevant);
+  Bucket-Payload ist `{"meta_data": …, "series": [[ts_ms, value|null], …]}`
+  (Paare, nicht Parallel-Arrays); `null`-Werte werden zu fehlenden Zeilen;
+  Einheiten sind bereits Vertragseinheiten (MW, EUR/MWh). Index-404 oder
+  leere Timestamp-Liste → leeres Ergebnis; ein 404 auf einem im Index
+  gelisteten Bucket oder doppelte Timestamps über Buckets sind
+  API-Abweichungen → `FetchValidationError`. Die Gültigkeitsfenster der
+  Regionen erzwingt SMARD selbst, der Client klemmt trotzdem an `REGIONS`
+  (gemeinsamer Helper `wattfrosch_fetch.validity`).
 
 Ein leeres Ergebnis (z. B. Energy-Charts 404 „keine Daten im Zeitraum") ist
 kein Fehler: Exit 0 mit Warnung auf stderr.
