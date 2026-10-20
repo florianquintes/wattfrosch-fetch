@@ -4,9 +4,13 @@ Clients are stubbed via the ``CLIENTS`` registry (monkeypatched) — no HTTP at
 all; client behavior itself is covered by the respx test suites per client.
 """
 
+import io
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import pyarrow.parquet as pq
 import pytest
 
 from wattfrosch_fetch import cli
@@ -83,10 +87,12 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_success_prints_counts_and_closes_client(
     stub: _StubClient,
+    tmp_path: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     stub.records = _records(48)
-    assert cli.main(list(BASE_ARGS)) == 0
+    argv = (*BASE_ARGS, "--out", str(tmp_path / "out.parquet"))
+    assert cli.main(list(argv)) == 0
     err = capsys.readouterr().err
     assert "metric=consumption.load records=48" in err
     assert stub.closed
@@ -100,10 +106,17 @@ def test_success_prints_counts_and_closes_client(
 
 def test_repeatable_metric_fetches_each(
     stub: _StubClient,
+    tmp_path: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     stub.records = _records(24)
-    argv = (*BASE_ARGS, "--metric", "price.day_ahead")
+    argv = (
+        *BASE_ARGS,
+        "--metric",
+        "price.day_ahead",
+        "--out",
+        str(tmp_path / "out.parquet"),
+    )
     assert cli.main(list(argv)) == 0
     assert [call[0] for call in stub.calls] == ["consumption.load", "price.day_ahead"]
     err = capsys.readouterr().err
@@ -190,9 +203,11 @@ def test_invalid_format_fails_with_exit_1(
 
 def test_empty_result_exits_zero_with_warning(
     stub: _StubClient,
+    tmp_path: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.main(list(BASE_ARGS)) == 0
+    argv = (*BASE_ARGS, "--out", str(tmp_path / "out.parquet"))
+    assert cli.main(list(argv)) == 0
     err = capsys.readouterr().err
     assert "metric=consumption.load records=0" in err
     assert "warning: empty result" in err
@@ -225,13 +240,75 @@ def test_config_error_from_client_maps_to_exit_1(
     assert "not covered" in capsys.readouterr().err
 
 
-def test_out_is_accepted_with_warning(
+def test_out_writes_ndjson_file(
     stub: _StubClient,
+    tmp_path: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stub.records = _records(2)
+    out = tmp_path / "out.json"
+    argv = (*BASE_ARGS, "--out", str(out), "--format", "json")
+    assert cli.main(list(argv)) == 0
+    lines = out.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["value"] == 42.0
+    assert stub.closed
+
+
+def test_out_writes_parquet_file(
+    stub: _StubClient,
+    tmp_path: Any,
+) -> None:
+    stub.records = _records(2)
+    out = tmp_path / "out.parquet"
+    argv = (*BASE_ARGS, "--out", str(out), "--format", "parquet")
+    assert cli.main(list(argv)) == 0
+    table = pq.read_table(out)
+    assert table.num_rows == 2
+    assert table.column("value").to_pylist() == [42.0, 42.0]
+
+
+def test_stdout_sink_writes_json(
+    stub: _StubClient,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    stub.records = _records(1)
+    assert cli.main(list(BASE_ARGS + ("--format", "json"))) == 0
+    lines = capsysbinary.readouterr().out.decode().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["metric"] == "consumption.load"
+
+
+def test_stdout_sink_writes_parquet(
+    stub: _StubClient,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    stub.records = _records(1)
+    assert cli.main(list(BASE_ARGS)) == 0
+    table = pq.read_table(io.BytesIO(capsysbinary.readouterr().out))
+    assert table.num_rows == 1
+
+
+def test_format_extension_mismatch_warns(
+    stub: _StubClient,
+    tmp_path: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     stub.records = _records(1)
-    argv = (*BASE_ARGS, "--out", "out.parquet", "--format", "parquet")
+    out = tmp_path / "data.csv"
+    argv = (*BASE_ARGS, "--out", str(out), "--format", "parquet")
     assert cli.main(list(argv)) == 0
-    err = capsys.readouterr().err
-    assert "export is not implemented yet" in err
-    assert stub.closed
+    assert "--format parquet does not match" in capsys.readouterr().err
+    assert pq.read_table(out).num_rows == 1
+
+
+def test_empty_result_with_out_writes_empty_file(
+    stub: _StubClient,
+    tmp_path: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "out.parquet"
+    argv = (*BASE_ARGS, "--out", str(out))
+    assert cli.main(list(argv)) == 0
+    assert "warning: empty result" in capsys.readouterr().err
+    assert pq.read_table(out).num_rows == 0

@@ -82,15 +82,29 @@ uv run wattfrosch-fetch --source smard --metric consumption.load \
 uv run wattfrosch-fetch --source energy-charts \
     --metric generation.solar --metric price.day_ahead \
     --region DE-LU --from 2026-10-10 --to 2026-10-12
+
+# Export: --out gibt die Zieldatei, --format das Format (default: parquet)
+uv run wattfrosch-fetch --source smard --metric consumption.load \
+    --region DE-LU --from 2026-10-10 --to 2026-10-12 \
+    --out out/load.parquet --format parquet
+
+# Ohne --out landen die Daten auf stdout (pipe-freundlich; Zusammenfassung
+# bleibt auf stderr) — z. B. NDJSON weiterverarbeiten:
+uv run wattfrosch-fetch --source smard --metric consumption.load \
+    --region DE-LU --from 2026-10-10 --to 2026-10-12 \
+    --format json | jq -c '.'
 ```
 
 Flag-Namen sind über alle wattfrosch-Module einheitlich: `--source`,
 `--metric` (wiederholbar), `--region`, `--from`, `--to` (ISO 8601, Datum
 ohne Zeit gilt als UTC; halb-offenes Intervall `[from, to)`), `--out`,
-`--format` (parquet|csv|json). `--out`/`--format` werden bereits akzeptiert
-und validiert; der Export selbst folgt im nächsten Issue — bis dahin
-schreibt die CLI eine Zusammenfassung je Metrik auf stderr, stdout bleibt
-dem Export vorbehalten.
+`--format` (parquet|csv|json). Ohne `--out` geht der Export an stdout
+(parquet binär via stdout-Buffer). Die Spalten folgen der Contract-
+Feldreihenfolge (`ts_utc, region, metric, value, source, resolution`);
+Werte stehen in Vertragseinheiten (z. B. Kelvin für Temperatur). Ein leeres
+Ergebnis ist kein Fehler (Exit 0 + Warnung); mit `--out` wird dann eine
+leere Datei (nur Schema) geschrieben. Bei Endungs-Mismatch zwischen
+`--out` und `--format` gewinnt `--format` (Warnung auf stderr).
 
 ## Fertig, wenn
 - Clients liefern valide MeasurementRecords

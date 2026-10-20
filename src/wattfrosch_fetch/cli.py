@@ -13,10 +13,12 @@ import argparse
 import sys
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Final, NoReturn
 
 from wattfrosch_fetch.clients import create_client
-from wattfrosch_fetch.contracts import METRICS, REGIONS
+from wattfrosch_fetch.contracts import METRICS, REGIONS, MeasurementRecord
+from wattfrosch_fetch.export import write_records
 from wattfrosch_fetch.http import (
     FetchConfigError,
     FetchHTTPError,
@@ -83,12 +85,15 @@ def _build_parser() -> _ArgumentParser:
         metavar="ISO8601",
         help="window end, exclusive",
     )
-    parser.add_argument("--out", help="output path (export lands in a later issue)")
+    parser.add_argument(
+        "--out",
+        help="output path; data goes to stdout when omitted",
+    )
     parser.add_argument(
         "--format",
         choices=sorted(_FORMATS),
         default="parquet",
-        help="export format (export lands in a later issue)",
+        help="export format (default: parquet)",
     )
     return parser
 
@@ -119,18 +124,28 @@ def _validate_args(args: argparse.Namespace) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _fetch_counts(
+def _fetch_records(
     args: argparse.Namespace,
     start: datetime,
     end: datetime,
-) -> Iterator[tuple[str, int]]:
+) -> Iterator[tuple[str, list[MeasurementRecord]]]:
     client = create_client(args.source)
     try:
         for metric in args.metric:
-            records = client.fetch_series(metric, args.region, start, end)
-            yield metric, sum(1 for _ in records)
+            records = list(client.fetch_series(metric, args.region, start, end))
+            yield metric, records
     finally:
         client.close()
+
+
+def _warn_format_mismatch(args: argparse.Namespace) -> None:
+    suffix = Path(args.out).suffix.lstrip(".").lower()
+    if suffix in _FORMATS and suffix != args.format:
+        print(
+            f"warning: --format {args.format} does not match "
+            f"--out extension .{suffix}; --format wins",
+            file=sys.stderr,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -143,16 +158,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return exc.code if isinstance(exc.code, int) else _EXIT_OK
         start, end = _validate_args(args)
         total = 0
-        for metric, count in _fetch_counts(args, start, end):
-            print(f"metric={metric} records={count}", file=sys.stderr)
-            total += count
+        records: list[MeasurementRecord] = []
+        for metric, fetched in _fetch_records(args, start, end):
+            print(f"metric={metric} records={len(fetched)}", file=sys.stderr)
+            total += len(fetched)
+            records.extend(fetched)
         if total == 0:
             print(_EMPTY_RESULT_WARNING, file=sys.stderr)
         if args.out is not None:
-            print(
-                "warning: --out is accepted but export is not implemented yet",
-                file=sys.stderr,
-            )
+            _warn_format_mismatch(args)
+            with open(args.out, "wb") as sink:
+                write_records(records, sink, args.format)
+        else:
+            write_records(records, sys.stdout.buffer, args.format)
     except FetchConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return _EXIT_CONFIG
