@@ -117,7 +117,13 @@ Client.
   alle Erzeugungs-/Verbrauchsarten in einem Call und wird intern je Metrik
   aufgeteilt. Rate-Limit: 2 Requests/Minute pro Client-IP und Endpunkt
   (`/price` Burst 2); bei 429 wird `Retry-After` berücksichtigt. Kein
-  clientseitiges Zerlegen des Fensters in v1.
+  clientseitiges Zerlegen des Fensters in v1. Achtung: die API liefert
+  15-Minuten-Schritte (`/public_power` immer, `/price` aktuell; historische
+  `/price`-Fenster stündlich) — fetch mittelt je UTC-Stunde auf PT1H;
+  unvollständige Stunden (None-Schritt oder Gap) werden übersprungen.
+  Quirks: `/price` verlangt die Zone UPPERCASE (`bzn=DE-LU`), die
+  Gültigkeitsfenster der Regionen (DE-AT-LU/DE-LU ab 2018-10-01) erzwingt
+  die API nicht — der Client klemmt das Fenster an `REGIONS`.
 - **SMARD**: implizite Paginierung in zwei Schritten — erst
   `index_{resolution}.json` je (Filter, Region) abrufen, dann die
   Wochentimestamps wählen, die `[start, end)` schneiden, und je Bucket einen

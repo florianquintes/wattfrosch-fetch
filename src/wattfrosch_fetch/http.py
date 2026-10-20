@@ -46,6 +46,10 @@ class FetchConfigError(FetchError):
 class FetchHTTPError(FetchError):
     """HTTP/transport error after retries exhausted -> CLI exit code 2."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class FetchValidationError(FetchError):
     """Response deviates from the expected API format -> CLI exit code 3."""
@@ -218,13 +222,17 @@ class BaseClient:
         *,
         params: dict[str, Any] | None = None,
         validate: Callable[[Any], None] | None = None,
+        not_found_ok: bool = False,
     ) -> Any:
         """GET ``url`` and return the parsed JSON body.
 
         Retries retryable failures (transport errors, 5xx, 429 honoring
         ``Retry-After``), raises :class:`FetchHTTPError` after exhaustion or
-        immediately on other 4xx. Non-JSON responses and deviations reported
-        by ``validate`` raise :class:`FetchValidationError`.
+        immediately on other 4xx. With ``not_found_ok=True`` a 404 response
+        returns ``None`` instead (sources reporting "no data for that
+        zone/range" as empty result, not error). Non-JSON responses and
+        deviations reported by ``validate`` raise
+        :class:`FetchValidationError`.
         """
         self._rate_limiter.acquire()
         try:
@@ -233,8 +241,10 @@ class BaseClient:
             raise FetchHTTPError(
                 f"{url}: transport error after retries: {exc}"
             ) from exc
-        except _RetryableHTTPError as exc:
-            raise FetchHTTPError(str(exc)) from exc
+        except FetchHTTPError as exc:
+            if not_found_ok and exc.status_code == 404:
+                return None
+            raise
         try:
             data = response.json()
         except ValueError as exc:
@@ -257,7 +267,10 @@ class BaseClient:
                 retry_after_seconds=retry_after,
             )
         if response.is_error:
-            raise FetchHTTPError(f"{url}: HTTP {response.status_code}")
+            raise FetchHTTPError(
+                f"{url}: HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
         return response
 
 
