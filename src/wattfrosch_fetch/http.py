@@ -61,6 +61,8 @@ class FetchSettings(BaseSettings):
     http_backoff_base_seconds: float = 1.0
     cache_enabled: bool = False
     cache_ttl_seconds: float = 300.0
+    archive_lag_days: int = 7
+    forecast_horizon_days: int = 16
 
 
 @dataclass(frozen=True)
