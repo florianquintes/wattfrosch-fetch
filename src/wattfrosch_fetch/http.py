@@ -26,13 +26,16 @@ from __future__ import annotations
 import random
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final
 
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tenacity import RetryCallState, Retrying, retry_if_exception, stop_after_attempt
+
+from wattfrosch_fetch.contracts import MeasurementRecord
 
 
 class FetchError(Exception):
@@ -215,6 +218,20 @@ class BaseClient:
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""
         self._client.close()
+
+    def fetch_series(
+        self,
+        metric: str,
+        region: str,
+        start: datetime,
+        end: datetime,
+    ) -> Iterable[MeasurementRecord]:
+        """Uniform fetch signature; implemented by each source client.
+
+        Yields ``MeasurementRecord``s for the half-open window
+        ``[start, end)``; missing values are missing rows.
+        """
+        raise NotImplementedError
 
     def get_json(
         self,

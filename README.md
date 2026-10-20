@@ -51,7 +51,9 @@ nicht an diesem Modul.
 
 ## Tech (Vorschlag)
 httpx, pydantic, tenacity, hishel, respx, uv
-CLI: argparse (oder typer) - Schalternamen müssen zu den anderen Modulen passen.
+CLI: argparse (User-Entscheid gegen typer — keine neue Runtime-Dependency);
+Schalternamen müssen zu den anderen Modulen passen (`--metric` ist
+wiederholbar; Single-Value-Aufrufe sind eine Teilmenge).
 
 ## Struktur (Vorschlag)
 src/wattfrosch_fetch/
@@ -63,13 +65,32 @@ tests/
 Dockerfile
 pyproject.toml
 
-## Quickstart (Platzhalter)
+## Quickstart
 Abhängigkeit: wattfrosch-contracts >= 0.1.0 (getaggt und auf PyPI/wheel
 verfügbar; CONTRACT_VERSION kann für Kompatibilitätsprüfung importiert werden).
 
+```sh
 uv sync
 uv run pytest
 uv run wattfrosch-fetch --help
+
+# Beispiel: Stromlast für DE-LU, zwei Tage (halb-offen [from, to))
+uv run wattfrosch-fetch --source smard --metric consumption.load \
+    --region DE-LU --from 2026-10-10 --to 2026-10-12
+
+# Mehrere Metriken in einem Lauf (--metric ist wiederholbar)
+uv run wattfrosch-fetch --source energy-charts \
+    --metric generation.solar --metric price.day_ahead \
+    --region DE-LU --from 2026-10-10 --to 2026-10-12
+```
+
+Flag-Namen sind über alle wattfrosch-Module einheitlich: `--source`,
+`--metric` (wiederholbar), `--region`, `--from`, `--to` (ISO 8601, Datum
+ohne Zeit gilt als UTC; halb-offenes Intervall `[from, to)`), `--out`,
+`--format` (parquet|csv|json). `--out`/`--format` werden bereits akzeptiert
+und validiert; der Export selbst folgt im nächsten Issue — bis dahin
+schreibt die CLI eine Zusammenfassung je Metrik auf stderr, stdout bleibt
+dem Export vorbehalten.
 
 ## Fertig, wenn
 - Clients liefern valide MeasurementRecords

@@ -14,6 +14,9 @@ dependencies = [
     "wattfrosch-contracts",
 ]
 
+[project.scripts]
+wattfrosch-fetch = "wattfrosch_fetch.cli:main"
+
 [build-system]
 requires = ["uv_build>=0.12.18,<0.13.0"]
 build-backend = "uv_build"
