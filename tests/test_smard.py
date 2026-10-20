@@ -6,10 +6,33 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import respx
 
+from wattfrosch_fetch.clients import smard
 from wattfrosch_fetch.clients.smard import SmardClient
-from wattfrosch_fetch.http import FetchConfigError, FetchSettings, FetchValidationError
+from wattfrosch_fetch.contracts import METRICS
+from wattfrosch_fetch.http import (
+    FetchConfigError,
+    FetchHTTPError,
+    FetchSettings,
+    FetchValidationError,
+)
 
 BASE = "https://www.smard.de/app/chart_data"
+
+
+class FakeClock:
+    """Injectable clock/sleep, mirroring test_http.FakeClock."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
 
 LIGNITE = "generation.lignite"
 LOAD = "consumption.load"
@@ -460,3 +483,108 @@ def test_start_not_before_end_config_error() -> None:
 
     with pytest.raises(FetchConfigError, match="half-open"):
         list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-02"), _dt("2026-10-01")))
+
+
+@respx.mock
+def test_index_non_object_response_raises_validation_error() -> None:
+    respx.get(_index_url(FILTER_IDS[LOAD], DE_LU)).respond(json=[])
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="not a JSON object"):
+        list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-01"), _dt("2026-10-02")))
+
+
+@respx.mock
+def test_index_missing_timestamps_raises_validation_error() -> None:
+    respx.get(_index_url(FILTER_IDS[LOAD], DE_LU)).respond(json={})
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="missing 'timestamps'"):
+        list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-01"), _dt("2026-10-02")))
+
+
+@respx.mock
+def test_index_non_integer_timestamps_raises_validation_error() -> None:
+    respx.get(_index_url(FILTER_IDS[LOAD], DE_LU)).respond(
+        json={"timestamps": ["1759276800000"]}
+    )
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="non-integer"):
+        list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-01"), _dt("2026-10-02")))
+
+
+@respx.mock
+def test_bucket_non_object_response_raises_validation_error() -> None:
+    day = "2026-10-01"
+    bucket_ms = _ms(_dt(day))
+    _mock_index(FILTER_IDS[LOAD], DE_LU, [bucket_ms])
+    respx.get(_bucket_url(FILTER_IDS[LOAD], DE_LU, bucket_ms)).respond(json=[])
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="not a JSON object"):
+        list(client.fetch_series(LOAD, DE_LU, _dt(day), _dt("2026-10-02")))
+
+
+@respx.mock
+def test_bucket_non_404_http_error_reraised() -> None:
+    # Only 404 on a listed bucket means index/data inconsistency (exit 3);
+    # any other HTTP error stays a FetchHTTPError (exit 2).
+    day = "2026-10-01"
+    bucket_ms = _ms(_dt(day))
+    _mock_index(FILTER_IDS[LOAD], DE_LU, [bucket_ms])
+    _mock_bucket(
+        FILTER_IDS[LOAD],
+        DE_LU,
+        bucket_ms,
+        {},
+        status_code=500,
+    )
+    client = _client(http_max_retries=0)
+
+    with pytest.raises(FetchHTTPError):
+        list(client.fetch_series(LOAD, DE_LU, _dt(day), _dt("2026-10-02")))
+
+
+def test_derived_metric_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    derived = METRICS[LOAD].model_copy(update={"derived": True})
+    monkeypatch.setattr(smard, "METRICS", {**METRICS, LOAD: derived})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="derived"):
+        list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-01"), _dt("2026-10-02")))
+
+
+def test_unknown_metric_entry_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Metric is covered by the source map but missing from METRICS.
+    monkeypatch.setattr(smard, "METRICS", {})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="unknown metric"):
+        list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-01"), _dt("2026-10-02")))
+
+
+def test_region_without_bidding_zone_entry_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Region is mapped for the source but has no REGIONS entry -> not a
+    # usable bidding zone.
+    monkeypatch.setattr(smard, "REGIONS", {})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="bidding zone"):
+        list(client.fetch_series(LOAD, DE_LU, _dt("2026-10-01"), _dt("2026-10-02")))
+
+
+def test_clock_and_sleep_kwargs_pass_through() -> None:
+    clock = FakeClock()
+
+    client = SmardClient(
+        settings=FetchSettings(http_backoff_base_seconds=0.0),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert client is not None

@@ -1,5 +1,7 @@
 """Tests for the base HTTP layer (respx only — no real API calls)."""
 
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 import respx
@@ -161,3 +163,69 @@ def test_cache_enabled_raises_config_error() -> None:
 def test_unknown_source_raises_config_error() -> None:
     with pytest.raises(FetchConfigError):
         BaseClient(base_url=BASE_URL, source="unknown-source")
+
+
+@respx.mock
+def test_429_without_retry_after_falls_back_to_backoff() -> None:
+    clock = FakeClock()
+    route = respx.get(f"{BASE_URL}/data").mock(
+        side_effect=[
+            httpx.Response(429),
+            httpx.Response(200, json={"ok": True}),
+        ],
+    )
+    client = _client(clock=clock, sleep=clock.sleep)
+
+    assert client.get_json("/data") == {"ok": True}
+    assert clock.sleeps == [0.0]
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_unparseable_retry_after_falls_back_to_backoff() -> None:
+    clock = FakeClock()
+    route = respx.get(f"{BASE_URL}/data").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "soon"}),
+            httpx.Response(200, json={"ok": True}),
+        ],
+    )
+    client = _client(clock=clock, sleep=clock.sleep)
+
+    assert client.get_json("/data") == {"ok": True}
+    assert clock.sleeps == [0.0]
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_close_closes_underlying_http_client() -> None:
+    client = _client()
+
+    client.close()
+
+    assert client._client.is_closed
+
+
+def test_base_fetch_series_is_abstract() -> None:
+    client = _client()
+
+    with pytest.raises(NotImplementedError):
+        client.fetch_series(
+            "weather.temperature_2m",
+            "DE-BERLIN",
+            datetime(2026, 10, 1, tzinfo=UTC),
+            datetime(2026, 10, 2, tzinfo=UTC),
+        )
+
+
+@respx.mock
+def test_transport_error_after_retries_raises_http_error() -> None:
+    settings = FetchSettings(http_backoff_base_seconds=0.0, http_max_retries=1)
+    route = respx.get(f"{BASE_URL}/data").mock(
+        side_effect=[httpx.ConnectError("boom")] * 2,
+    )
+    client = _client(settings=settings)
+
+    with pytest.raises(FetchHTTPError, match="transport error after retries"):
+        client.get_json("/data")
+    assert route.call_count == 2

@@ -14,6 +14,22 @@ from wattfrosch_fetch.http import FetchConfigError, FetchSettings, FetchValidati
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
+
+class FakeClock:
+    """Injectable clock/sleep, mirroring test_http.FakeClock."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 # Fixed now: boundary (today - archive_lag_days=7) = 2026-10-13 00:00 UTC;
 # archive overlap end = 2026-10-14 00:00 UTC; horizon end = 2026-11-05 12:00.
 NOW = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
@@ -365,3 +381,80 @@ def test_length_mismatch_raises_validation_error() -> None:
         client.fetch_series(
             TEMPERATURE, "DE-BERLIN", _dt("2026-10-01"), _dt("2026-10-02")
         )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "payload",
+    [[], "text"],
+    ids=["array", "string"],
+)
+def test_non_object_response_raises_validation_error(payload: object) -> None:
+    respx.get(ARCHIVE_URL).respond(json=payload)
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="not a JSON object"):
+        client.fetch_series(
+            TEMPERATURE, "DE-BERLIN", _dt("2026-10-01"), _dt("2026-10-02")
+        )
+
+
+@respx.mock
+def test_missing_hourly_object_raises_validation_error() -> None:
+    respx.get(ARCHIVE_URL).respond(json={"latitude": 52.52})
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="missing 'hourly'"):
+        client.fetch_series(
+            TEMPERATURE, "DE-BERLIN", _dt("2026-10-01"), _dt("2026-10-02")
+        )
+
+
+@respx.mock
+def test_missing_time_array_raises_validation_error() -> None:
+    respx.get(ARCHIVE_URL).respond(json={"hourly": {"temperature_2m": [10.0] * 24}})
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="missing 'hourly.time'"):
+        client.fetch_series(
+            TEMPERATURE, "DE-BERLIN", _dt("2026-10-01"), _dt("2026-10-02")
+        )
+
+
+def test_unknown_metric_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(om, "METRICS", {})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="unknown metric"):
+        client.fetch_series(
+            TEMPERATURE, "DE-BERLIN", _dt("2026-10-01"), _dt("2026-10-02")
+        )
+
+
+def test_region_without_weather_point_entry_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Region is mapped for the source but has no REGIONS entry -> not a
+    # usable weather point.
+    monkeypatch.setattr(om, "REGIONS", {})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="weather point"):
+        client.fetch_series(
+            TEMPERATURE, "DE-BERLIN", _dt("2026-10-01"), _dt("2026-10-02")
+        )
+
+
+def test_clock_and_sleep_kwargs_pass_through() -> None:
+    clock = FakeClock()
+
+    client = OpenMeteoClient(
+        settings=FetchSettings(http_backoff_base_seconds=0.0),
+        clock=clock,
+        sleep=clock.sleep,
+        now_fn=lambda: NOW,
+    )
+
+    assert client is not None

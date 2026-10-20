@@ -6,11 +6,29 @@ from datetime import UTC, datetime
 import pytest
 import respx
 
+from wattfrosch_fetch.clients import energy_charts
 from wattfrosch_fetch.clients.energy_charts import EnergyChartsClient
+from wattfrosch_fetch.contracts import METRICS
 from wattfrosch_fetch.http import FetchConfigError, FetchSettings, FetchValidationError
 
 POWER_URL = "https://api.energy-charts.info/public_power"
 PRICE_URL = "https://api.energy-charts.info/price"
+
+
+class FakeClock:
+    """Injectable clock/sleep, mirroring test_http.FakeClock."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
 
 SOLAR = "generation.solar"
 HYDRO = "generation.hydro"
@@ -551,3 +569,175 @@ def test_start_not_before_end_raises_config_error() -> None:
 
     with pytest.raises(FetchConfigError, match="before end"):
         client.fetch_series(SOLAR, DE_LU, _dt("2026-10-02"), _dt("2026-10-01"))
+
+
+@respx.mock
+def test_power_non_object_response_raises_validation_error() -> None:
+    respx.get(POWER_URL).respond(json=[])
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="not a JSON object"):
+        client.fetch_series(SOLAR, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+@respx.mock
+def test_power_missing_unix_seconds_raises_validation_error() -> None:
+    respx.get(POWER_URL).respond(json={"production_types": []})
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="missing 'unix_seconds'"):
+        client.fetch_series(SOLAR, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+@respx.mock
+def test_production_type_without_name_raises_validation_error() -> None:
+    respx.get(POWER_URL).respond(
+        json={"unix_seconds": _unix_hours("2026-10-01"), "production_types": [{}]}
+    )
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="without string 'name'"):
+        client.fetch_series(SOLAR, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+@respx.mock
+def test_price_non_object_response_raises_validation_error() -> None:
+    respx.get(PRICE_URL).respond(json=[])
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="not a JSON object"):
+        client.fetch_series(PRICE, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+@respx.mock
+def test_price_missing_unix_seconds_raises_validation_error() -> None:
+    respx.get(PRICE_URL).respond(json={"price": []})
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="missing 'unix_seconds'"):
+        client.fetch_series(PRICE, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+@respx.mock
+def test_price_non_integer_unix_seconds_raises_validation_error() -> None:
+    respx.get(PRICE_URL).respond(
+        json=_price_response(["1759276800"], [50.0])  # type: ignore[arg-type]
+    )
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="unix_seconds"):
+        client.fetch_series(PRICE, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+@respx.mock
+def test_price_null_value_skips_hour() -> None:
+    # A None price means the hourly mean would be partial -> missing row.
+    prices: list[object] = [10.0, 20.0, 30.0, 40.0] * 2 + [50.0] * 88
+    prices[1] = None
+    respx.get(PRICE_URL).respond(
+        json=_price_response(_unix_quarters("2026-10-01"), prices)
+    )
+    client = _client()
+
+    records = list(
+        client.fetch_series(PRICE, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+    )
+
+    assert len(records) == 23
+    assert _dt("2026-10-01", 0) not in {record.ts_utc for record in records}
+
+
+@respx.mock
+def test_single_timestamp_price_defaults_to_hourly_steps() -> None:
+    # Fewer than two timestamps: steps per hour defaults to 1 -> the one
+    # value becomes an hourly record.
+    respx.get(PRICE_URL).respond(
+        json=_price_response([int(_dt("2026-10-01", 10).timestamp())], [42.0])
+    )
+    client = _client()
+
+    records = list(
+        client.fetch_series(PRICE, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+    )
+
+    assert len(records) == 1
+    assert records[0].ts_utc == _dt("2026-10-01", 10)
+    assert records[0].value == pytest.approx(42.0)
+
+
+@respx.mock
+def test_price_unexpected_step_size_raises_validation_error() -> None:
+    base = int(_dt("2026-10-01", 10).timestamp())
+    unix = [base, base + 700, base + 1400]
+    respx.get(PRICE_URL).respond(json=_price_response(unix, [1.0, 2.0, 3.0]))
+    client = _client()
+
+    with pytest.raises(FetchValidationError, match="step size"):
+        client.fetch_series(PRICE, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+def test_derived_metric_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    derived = METRICS[SOLAR].model_copy(update={"derived": True})
+    monkeypatch.setattr(energy_charts, "METRICS", {**METRICS, SOLAR: derived})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="derived"):
+        client.fetch_series(SOLAR, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+def test_unknown_metric_entry_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Metric is covered by the source map but missing from METRICS.
+    monkeypatch.setattr(energy_charts, "METRICS", {})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="unknown metric"):
+        client.fetch_series(SOLAR, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+def test_region_without_bidding_zone_entry_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Region is mapped for the source but has no REGIONS entry -> not a
+    # usable bidding zone.
+    monkeypatch.setattr(energy_charts, "REGIONS", {})
+    client = _client()
+
+    with pytest.raises(FetchConfigError, match="bidding zone"):
+        client.fetch_series(SOLAR, DE_LU, _dt("2026-10-01"), _dt("2026-10-02"))
+
+
+def test_clock_and_sleep_kwargs_pass_through() -> None:
+    clock = FakeClock()
+
+    client = EnergyChartsClient(
+        settings=FetchSettings(http_backoff_base_seconds=0.0),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert client is not None
+
+
+def test_import_guard_rejects_series_name_without_source_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Module-level guard: every _SERIES_NAMES target metric must be covered
+    # by SOURCE_METRIC_MAP (never hardcoded keys).
+    import importlib
+
+    import wattfrosch_fetch.contracts as contracts_module
+    from wattfrosch_fetch.clients import energy_charts as energy_charts_module
+
+    modified = {
+        source: {m for m in metrics if m != SOLAR}
+        for source, metrics in contracts_module.SOURCE_METRIC_MAP.items()
+    }
+    monkeypatch.setattr(contracts_module, "SOURCE_METRIC_MAP", modified)
+
+    with pytest.raises(FetchConfigError, match="generation.solar"):
+        importlib.reload(energy_charts_module)
+
+    monkeypatch.undo()
+    importlib.reload(energy_charts_module)
