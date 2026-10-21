@@ -1,206 +1,221 @@
 # wattfrosch-fetch
 
-Erste Stufe des wattfrosch-Baukastens: Daten von externen Wetter- und
-Energie-Quellen holen und in einem einheitlichen, normalisierten Format
-bereitstellen.
+Fetch external weather and energy data and normalize it to the wattfrosch data
+contract (`MeasurementRecord`).
 
-## Rolle im System
-Kennt alle externen Schnittstellen (Application Programming Interfaces, APIs)
-und übersetzt ihre unterschiedlichen Formate in den gemeinsamen Daten-Contract
-aus wattfrosch-contracts. Alle anderen Module hängen nur an diesem Contract,
-nicht an diesem Modul.
+Part of the [wattfrosch](https://github.com/florianquintes/wattfrosch) module
+family.
 
-## In Scope
-- HTTP-Clients je Datenquelle
-- Normalisierung auf MeasurementRecord (aus wattfrosch-contracts)
-- Einheiten-Konversion in die Metrik-Einheit (z.B. °C -> K für
-  weather.temperature_2m, km/h -> m/s für weather.wind_speed_10m;
-  Pflicht laut Contract "Responsibility boundaries"; Umsetzungen in
-  conversions.py)
-- Überspringen von derived-Metriken (die werden nie gefetcht, nur in transform
-  berechnet)
-- Retry/Backoff, Rate-Limiting; Response-Caching ist in v1 AUS
-  (Entscheidung Milestone 0; hishel-Backend später geplant,
-  `cache_enabled=True` ist ein Konfigurationsfehler)
-- CLI zum Export (Parquet, CSV, JSON)
-- Nutzung von SOURCE_METRIC_MAP (interne Metrik -> externer Schlüssel) und
-  SOURCE_REGION_MAP (interne Region -> externer Code) aus wattfrosch-contracts
+## What is this?
 
-## Out of Scope
-- Datenbank, Transformation/Analytik, Orchestrierung
-- Definition des Contracts (liegt in wattfrosch-contracts)
+This is the first stage of the wattfrosch pipeline. It knows all external APIs
+and translates their differing formats into the shared data contract from
+[wattfrosch-contracts](https://github.com/florianquintes/wattfrosch-contracts).
+All other wattfrosch modules depend only on that contract, not on this module.
 
-## Schnittstellen
-- Nutzt: wattfrosch-contracts (MeasurementRecord, METRICS, REGIONS, SOURCES,
-  SOURCE_METRIC_MAP, SOURCE_REGION_MAP, CONTRACT_VERSION)
-- Bietet: je einen Client pro Quelle mit einheitlicher Abrufmethode
-  (fetch_series(metric, region, start, end) -> Iterable[MeasurementRecord])
-- CLI-Schalter (einheitlich über alle Module): --source, --metric, --region,
-  --from, --to, --out, --format
+Implemented sources:
 
-## Contract-Regeln, die fetch einhält
-- Keine NULL-Zeilen: fehlende Werte sind fehlende Zeilen (Lücken füllt
-  später transform).
-- Halb-offene Intervalle [start, end); ts_utc ist Intervallstart,
-  resolution ist v1 nur "PT1H" (stündlich).
-- Region nur liefern, wenn sie zum Zeitpunkt ts_utc gültig ist (Bidding-Zone-
-  Historie DE-AT-LU -> DE-LU ab 2018-10-01 beachten; "AT" allein ist nie gültig).
-- Keine NULL-Werte, keine NaN/Inf-Werte.
-- Temperatur in Kelvin liefern (Quelle liefert °C -> Konversion im Fetch);
-  Windgeschwindigkeit in m/s (Open-Meteo liefert km/h -> Konversion im Fetch).
-- SMARD kann generation.oil nicht liefern (kein dokumentierter Filter in der
-  SMARD-API); die Filter-IDs für alle übrigen Energie-Metriken stehen fertig
-  in SOURCE_METRIC_MAP bzw. SMARD_readme.md in wattfrosch-contracts.
-- Externe Quellen werden streng überwacht (contracts ist bewusst lenient,
-  Abweichungen der API meldet fetch).
+| Source | What it provides | Notes |
+|---|---|---|
+| `smard` | generation, load, prices (SMARD / Bundesnetzagentur) | cannot provide `generation.oil` |
+| `energy-charts` | generation, load, prices (Fraunhofer ISE) | 15-minute steps are averaged to hourly |
+| `open-meteo` | weather (no API key) | archive (ERA5) + forecast split |
 
-## Tech (Vorschlag)
-httpx (sync), pydantic, pydantic-settings (Env-Präfix
-`WATTFROSCH_FETCH_`), tenacity, respx (nur Tests), uv.
-Caching: v1 aus, hishel als späteres Backend geplant.
-CLI: argparse (User-Entscheid gegen typer — keine neue Runtime-Dependency);
-Schalternamen müssen zu den anderen Modulen passen (`--metric` ist
-wiederholbar; Single-Value-Aufrufe sind eine Teilmenge).
+Features:
 
-## Struktur (real)
+- One client per source with a uniform signature:
+  `fetch_series(metric, region, start, end) -> Iterable[MeasurementRecord]`
+  (dispatch via `create_client()` / the `CLIENTS` registry)
+- Retries with exponential backoff and `Retry-After` handling (tenacity),
+  per-source sliding-window rate limits
+- Unit conversions into the contract units (°C → K, km/h → m/s)
+- Region validity clamping (SCD-2 windows: DE-AT-LU → DE-LU on 2018-10-01)
+- Export to parquet/csv/ndjson (pyarrow) via CLI or `write_records()`
+- Strict API monitoring: contracts is deliberately lenient, fetch reports
+  deviations (`FetchValidationError`)
+- Response caching is OFF in v1 (hishel backend planned later;
+  `cache_enabled=True` raises `FetchConfigError`)
+
+Package structure:
+
+```
 src/wattfrosch_fetch/
-  contracts.py     # einzige Import-Stelle für alle Contract-Symbole
-  version.py       # Import-Zeit-Guard: assert_contract_version(CONTRACT_VERSION)
-  http.py          # Basis-Layer: Retry, Backoff, Rate-Limit (Cache aus, v1)
-  clients/         # ein Modul je Datenquelle + CLIENTS-Registry + create_client()
-  validity.py      # clamp_to_validity (Region-Gültigkeitsfenster)
+  contracts.py     # single import point for all contract symbols
+  version.py       # import-time guard: assert_contract_version(CONTRACT_VERSION)
+  http.py          # base layer: retry, backoff, rate limit (cache off, v1)
+  clients/         # one module per source + CLIENTS registry + create_client()
+  validity.py      # clamp_to_validity (region validity windows)
   conversions.py   # celsius_to_kelvin, kilometers_per_hour_to_meters_per_second
-  normalize.py     # leerer Stub — Normalisierung lebt in den Client-Modulen
+  normalize.py     # empty stub — normalization lives in the client modules
   export.py        # write_records: parquet/csv/ndjson via pyarrow
   cli.py
-tests/
-pyproject.toml
-
-## Quickstart
-Abhängigkeit: wattfrosch-contracts >= 0.1.0 (getaggt und auf PyPI/wheel
-verfügbar). Contract-Version-Guard: beim Import prüft version.py die
-CONTRACT_VERSION gegen `CONTRACT_VERSION_SUPPORTED` ("0.1", Major.Minor-
-Vergleich; Patch wird akzeptiert) und wirft sonst `ContractVersionError`
-(Fail fast beim Import).
-
-```sh
-uv sync
-uv run pytest
-uv run wattfrosch-fetch --help
-
-# Beispiel: Stromlast für DE-LU, zwei Tage (halb-offen [from, to))
-uv run wattfrosch-fetch --source smard --metric consumption.load \
-    --region DE-LU --from 2026-10-10 --to 2026-10-12
-
-# Mehrere Metriken in einem Lauf (--metric ist wiederholbar)
-uv run wattfrosch-fetch --source energy-charts \
-    --metric generation.solar --metric price.day_ahead \
-    --region DE-LU --from 2026-10-10 --to 2026-10-12
-
-# Export: --out gibt die Zieldatei, --format das Format (default: parquet)
-uv run wattfrosch-fetch --source smard --metric consumption.load \
-    --region DE-LU --from 2026-10-10 --to 2026-10-12 \
-    --out out/load.parquet --format parquet
-
-# Ohne --out landen die Daten auf stdout (pipe-freundlich; Zusammenfassung
-# bleibt auf stderr) — z. B. NDJSON weiterverarbeiten:
-uv run wattfrosch-fetch --source smard --metric consumption.load \
-    --region DE-LU --from 2026-10-10 --to 2026-10-12 \
-    --format json | jq -c '.'
 ```
 
-Flag-Namen sind über alle wattfrosch-Module einheitlich: `--source`,
-`--metric` (wiederholbar), `--region`, `--from`, `--to` (ISO 8601, Datum
-ohne Zeit gilt als UTC; halb-offenes Intervall `[from, to)`), `--out`,
-`--format` (parquet|csv|json). Ohne `--out` geht der Export an stdout
-(parquet binär via stdout-Buffer). Die Spalten folgen der Contract-
-Feldreihenfolge (`ts_utc, region, metric, value, source, resolution`);
-Werte stehen in Vertragseinheiten (z. B. Kelvin für Temperatur). Ein leeres
-Ergebnis ist kein Fehler (Exit 0 + Warnung); mit `--out` wird dann eine
-leere Datei (nur Schema) geschrieben. Bei Endungs-Mismatch zwischen
-`--out` und `--format` gewinnt `--format` (Warnung auf stderr).
+## Installation
 
-## Fertig, wenn
-- Clients liefern valide MeasurementRecords
-- CLI exportiert nach Parquet/CSV/JSON
-- Tests grün (mit gemockten Antworten, 100 % Coverage)
-- Dockerfile baut (OFFEN — noch nicht umgesetzt; Pfad-Abhängigkeit auf
-  wattfrosch-contracts funktioniert in einem Image so nicht und braucht
-  eine eigene Lösung)
+Requires Python 3.13+ (`requires-python >= 3.13`). This repo depends on the
+sibling repo `wattfrosch-contracts` as an editable path source
+(`[tool.uv.sources]`), so it must exist next to this repo or `uv sync` fails:
 
-## Quellenrollen und Fehlerverhalten
-Alle Quellen sind gleichrangig: `--source` entscheidet immer explizit; es
-gibt keine bevorzugte Quelle und kein stilles Ausweichen auf eine andere
-Quelle. Eine Metrik/Region-Kombination, die die gewählte Quelle nicht
-abdeckt, ist ein Konfigurationsfehler. `generation.oil` ist in v1
-ausschließlich über energy-charts verfügbar — SMARD hat keinen dokumentierten
-Filter dafür, und fetch erfindet keinen. Ein Alternativ-Provider wäre eine
-neue Quelle im Contract (SOURCES/SOURCE_METRIC_MAP), kein Fetch-Workaround.
+```sh
+git clone https://github.com/florianquintes/wattfrosch-contracts
+git clone https://github.com/florianquintes/wattfrosch-fetch
+cd wattfrosch-fetch
+uv sync --locked
+```
 
-Fehler-/Teilausfall-Verhalten: Schlägt die Quelle fehl, schlägt der ganze
-Lauf fehl — kein Überspringen mit Warnung. Lücken füllt transform;
-Wiederholungsläufe sind idempotent (der Store dedupliziert per
+The contract version is checked at import time: `version.py` compares
+`CONTRACT_VERSION` against `CONTRACT_VERSION_SUPPORTED` ("0.1", major.minor
+comparison; patches are accepted) and raises `ContractVersionError` on
+mismatch — fail fast before any request is made.
+
+## Usage
+
+CLI (export defaults to parquet; `--metric` is repeatable):
+
+```sh
+uv run wattfrosch-fetch --source smard --metric consumption.load \
+    --region DE-LU --from 2026-10-10 --to 2026-10-12 \
+    --out load.parquet
+```
+
+CLI flags (uniform across all wattfrosch modules):
+
+| Flag | Meaning |
+|---|---|
+| `--source` | required: `smard` \| `energy-charts` \| `open-meteo` |
+| `--metric` | required, repeatable; internal keys from `METRICS` (derived metrics are rejected) |
+| `--region` | required; internal codes from `REGIONS` |
+| `--from` / `--to` | ISO 8601; date-only counts as UTC; half-open `[from, to)` |
+| `--out` | target file; omitted → stdout (pipe-friendly, summary on stderr) |
+| `--format` | `parquet` \| `csv` \| `json` (NDJSON), default `parquet` |
+
+Output columns follow the contract field order:
+`ts_utc, region, metric, value, source, resolution`; values are in contract
+units (e.g. kelvin for temperature). A `--out`/`--format` extension mismatch
+is resolved in favor of `--format` (with a stderr warning).
+
+Exit codes: `0` success (an **empty result is also success**, with a stderr
+warning), `1` configuration/usage error (unknown source/metric/region,
+metric not covered by the source, derived metric requested, invalid format),
+`2` HTTP/transport error after retries are exhausted, `3` response validation
+error (API deviation).
+
+Library:
+
+```python
+from datetime import datetime, UTC
+
+from wattfrosch_fetch.clients import create_client
+
+client = create_client("smard")
+records = client.fetch_series(
+    "consumption.load", "DE-LU",
+    datetime(2026, 10, 10, tzinfo=UTC), datetime(2026, 10, 12, tzinfo=UTC),
+)
+for record in records:
+    print(record.ts_utc, record.metric, record.value)
+
+client.close()
+```
+
+All sources are equal — `--source` always decides explicitly; there is no
+preferred source and no silent fallback. If a source fails, the whole run
+fails. Repeated runs are idempotent (the store deduplicates via
 `ON CONFLICT`).
 
-Exit-Codes des CLI:
-- 0: Erfolg
-- 1: Konfigurations-/Usage-Fehler (unbekannte Quelle/Metrik/Region, Metrik
-  nicht durch die Quelle abgedeckt, derived-Metrik angefragt, Region im
-  Zeitfenster ungültig, ungültiges Format)
-- 2: HTTP-/Transportfehler nach ausgeschöpften Retries (4xx/5xx, Timeout,
-  Rate-Limit)
-- 3: Response-Validierungsfehler (API-Abweichung, strikter
-  Validierungs-Hook)
-- Ein leeres Ergebnis ist kein Fehler: Exit 0 mit Warnung auf stderr
-  (Lücken füllt transform).
+## Contributing
 
-## Paginierung und Fensteraufteilung
-Die einheitliche Abrufsignatur bleibt `fetch_series(metric, region, start,
-end)`; das Batching mehrerer Metriken pro HTTP-Request passiert intern im
-Client.
+Tooling is uv (Python 3.13). CI order matters: lint → typecheck → test.
 
-- **Open-Meteo**: keine Paginierung, aber Fensteraufteilung in zwei Requests:
-  Archiv (ERA5, `archive-api.open-meteo.com`, `start_date`/`end_date`) für
-  `[start, heute - archive_lag_days)` und Forecast-Endpoint
-  (`api.open-meteo.com`) für den Rest (bis `heute + forecast_horizon_days`,
-  default 16 Tage). Überlappung 1 Tag; bei Duplikaten gewinnt der Archiv-Lauf
-  (spiegelt die `ON CONFLICT`-Idempotenz des Stores). Alle angefragten
-  stündlichen Variablen werden je Call gebündelt (`hourly=a,b,c`).
-- **Energy-Charts**: keine Paginierung. Ein Request pro (Region, Fenster)
-  über `start`/`end` (ISO 8601 oder Unix-Sekunden); `/public_power` liefert
-  alle Erzeugungs-/Verbrauchsarten in einem Call und wird intern je Metrik
-  aufgeteilt. Rate-Limit: 2 Requests/Minute pro Client-IP und Endpunkt
-  (`/price` Burst 2); bei 429 wird `Retry-After` berücksichtigt. Kein
-  clientseitiges Zerlegen des Fensters in v1. Achtung: die API liefert
-  15-Minuten-Schritte (`/public_power` immer, `/price` aktuell; historische
-  `/price`-Fenster stündlich) — fetch mittelt je UTC-Stunde auf PT1H;
-  unvollständige Stunden (None-Schritt oder Gap) werden übersprungen.
-  Mehrere Metriken teilen sich per In-Run-Memoization die letzte Response
-  je (URL, Zone, Fenster) — bewusst kein HTTP-Caching, aber nötig, um unter
-  dem 2-Requests/Minute-Limit mehrere Metriken in einem Lauf zu holen.
-  Quirks: `/price` verlangt die Zone UPPERCASE (`bzn=DE-LU`), die
-  Gültigkeitsfenster der Regionen (DE-AT-LU/DE-LU ab 2018-10-01) erzwingt
-  die API nicht — der Client klemmt das Fenster an `REGIONS`.
-- **SMARD**: implizite Paginierung in zwei Schritten — erst
-  `index_{resolution}.json` je (Filter, Region) abrufen, dann die
-  Wochentimestamps wählen, die `[start, end)` schneiden, und je Bucket einen
-  Request stellen. Pfad-Quirk: `filterCopy`/`regionCopy` müssen die
-  Pfad-Parameter wiederholen. Quirks: Bucket-Grenzen sind Berlin-lokale
-  Mitternächte (Epoch-ms bleiben absolut → für die Zeilen irrelevant);
-  Bucket-Payload ist `{"meta_data": …, "series": [[ts_ms, value|null], …]}`
-  (Paare, nicht Parallel-Arrays); `null`-Werte werden zu fehlenden Zeilen;
-  Einheiten sind bereits Vertragseinheiten (MW, EUR/MWh). Index-404 oder
-  leere Timestamp-Liste → leeres Ergebnis; ein 404 auf einem im Index
-  gelisteten Bucket oder doppelte Timestamps über Buckets sind
-  API-Abweichungen → `FetchValidationError`. Die Gültigkeitsfenster der
-  Regionen erzwingt SMARD selbst, der Client klemmt trotzdem an `REGIONS`
-  (gemeinsamer Helper `wattfrosch_fetch.validity`).
+```bash
+uv sync --locked                # install deps into .venv
+uv run ruff check .             # lint
+uv run ruff format --check .    # formatting gate
+uv run pyrefly check            # type check (pyrefly, not mypy)
+uv run pytest                   # tests
+```
 
-Ein leeres Ergebnis (z. B. Energy-Charts 404 „keine Daten im Zeitraum") ist
-kein Fehler: Exit 0 mit Warnung auf stderr.
+Conventions:
 
-## Offene Punkte (mit OpenCode erarbeiten)
-- Dockerfile (Pfad-Abhängigkeit auf wattfrosch-contracts braucht eine
-  Image-Lösung)
-- normalize.py ist ein leerer Stub; Normalisierung lebt in den Client-Modulen
-  (bewusst so entschieden — Stub später entfernen oder füllen)
+- Type checking is **pyrefly** (always use pyrefly, not mypy).
+- Tests mock HTTP with `respx` (dev dependency) — never hit real external
+  APIs in tests (the test suite blocks real sockets). Coverage
+  `fail_under = 100`.
+- CLI flags are uniform across all wattfrosch modules; do not deviate.
+- Never hardcode metric keys or region codes — use `SOURCE_METRIC_MAP` /
+  `SOURCE_REGION_MAP` from wattfrosch-contracts (see the mappings section).
+- Contract rules fetch must uphold: no NULL rows (a missing value is a
+  missing row), half-open intervals `[start, end)`, `PT1H` only, temperature
+  in kelvin, wind speed in m/s, never fetch derived metrics, no NaN/Inf
+  values, region validity windows respected, `generation.oil` only via
+  energy-charts.
+
+Open points:
+
+- Dockerfile (the path dependency on wattfrosch-contracts needs an image
+  solution)
+- `normalize.py` is an empty stub; normalization lives in the client modules
+  (deliberate decision — remove or fill the stub later)
+
+## Mappings
+
+fetch translates internal metric keys and region codes to the source-specific
+external keys using `SOURCE_METRIC_MAP` and `SOURCE_REGION_MAP` from
+wattfrosch-contracts — the full tables live in the
+[contracts README](https://github.com/florianquintes/wattfrosch-contracts#mappings).
+How each client uses them:
+
+### smard
+
+- Metric keys map to numeric filter IDs from the SMARD API readme
+  (e.g. `generation.solar` → `4068`, `consumption.load` → `410`,
+  `price.day_ahead` → `4169`); `generation.oil` has no documented filter and
+  is rejected as a configuration error.
+- Region codes are used as-is (`DE-AT-LU`, `DE-LU`).
+- Data access is two-step implicit pagination: `index_hour.json` lists week
+  buckets, then one request per bucket. Bucket payload is
+  `{"meta_data": ..., "series": [[ts_ms, value|null], ...]}` — `null` values
+  become missing rows. Index 404 or an empty timestamp list → empty result;
+  a 404 on a listed bucket or duplicate timestamps are API deviations.
+
+### energy-charts
+
+- Metric keys map to themselves (identity); a module-level guard checks at
+  import time that every mapped series name exists in `SOURCE_METRIC_MAP`.
+  Multiple API series can feed one metric (`generation.hydro` = run-of-river
+  + water reservoir, summed).
+- Region codes map to lowercase zone ids (`DE-LU` → `de-lu`); the `/price`
+  endpoint requires the zone UPPERCASE (`bzn=DE-LU`).
+- The API delivers 15-minute steps — fetch averages per UTC hour onto `PT1H`;
+  incomplete hours are skipped entirely (no partial means). In-run
+  memoization shares the last response per (URL, zone, window) across metrics
+  to stay under the 2 requests/minute rate limit.
+- `not_found_ok=True`: a 404 ("no data in period") yields an empty result.
+
+### open-meteo
+
+- Weather metrics map to the raw API variable names (`temperature_2m`,
+  `wind_speed_10m`, `precipitation`, `cloud_cover`).
+- Region codes map to `"lat,lon"` strings (`DE-BERLIN` → `52.52,13.405`).
+- The window is split into two requests: archive (ERA5) for
+  `[start, today - archive_lag_days)` and the forecast endpoint for the rest
+  (up to `today + forecast_horizon_days`, default 16 days), with a 1-day
+  overlap where the archive run wins on duplicate timestamps.
+- Unit conversions applied: °C → K (temperature), km/h → m/s (wind speed).
+
+### Rate limits (per client instance, sliding window)
+
+| Source | Default limit |
+|---|---|
+| open-meteo | 60 requests / minute |
+| energy-charts | 2 requests / minute |
+| smard | 30 requests / minute |
+
+Overridable via the client constructor (`rate_limit=`); unknown sources
+without an override raise `FetchConfigError`. Retries back off exponentially
+with jitter; a 429 response honors the `Retry-After` header.
+
+## License
+
+See [LICENSE](LICENSE).
