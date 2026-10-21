@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 concurrency:
@@ -49,4 +48,4 @@ jobs:
 
       - name: Run tests
         working-directory: wattfrosch-fetch
-        run: uv run pytest
+        run: uv run pytest --cov
