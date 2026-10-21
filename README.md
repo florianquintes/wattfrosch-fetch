@@ -14,10 +14,14 @@ nicht an diesem Modul.
 - HTTP-Clients je Datenquelle
 - Normalisierung auf MeasurementRecord (aus wattfrosch-contracts)
 - Einheiten-Konversion in die Metrik-Einheit (z.B. °C -> K für
-  weather.temperature_2m; Pflicht laut Contract "Responsibility boundaries")
+  weather.temperature_2m, km/h -> m/s für weather.wind_speed_10m;
+  Pflicht laut Contract "Responsibility boundaries"; Umsetzungen in
+  conversions.py)
 - Überspringen von derived-Metriken (die werden nie gefetcht, nur in transform
   berechnet)
-- Retry/Backoff, Rate-Limiting, Response-Caching
+- Retry/Backoff, Rate-Limiting; Response-Caching ist in v1 AUS
+  (Entscheidung Milestone 0; hishel-Backend später geplant,
+  `cache_enabled=True` ist ein Konfigurationsfehler)
 - CLI zum Export (Parquet, CSV, JSON)
 - Nutzung von SOURCE_METRIC_MAP (interne Metrik -> externer Schlüssel) und
   SOURCE_REGION_MAP (interne Region -> externer Code) aus wattfrosch-contracts
@@ -42,7 +46,8 @@ nicht an diesem Modul.
 - Region nur liefern, wenn sie zum Zeitpunkt ts_utc gültig ist (Bidding-Zone-
   Historie DE-AT-LU -> DE-LU ab 2018-10-01 beachten; "AT" allein ist nie gültig).
 - Keine NULL-Werte, keine NaN/Inf-Werte.
-- Temperatur in Kelvin liefern (Quelle liefert °C -> Konversion im Fetch).
+- Temperatur in Kelvin liefern (Quelle liefert °C -> Konversion im Fetch);
+  Windgeschwindigkeit in m/s (Open-Meteo liefert km/h -> Konversion im Fetch).
 - SMARD kann generation.oil nicht liefern (kein dokumentierter Filter in der
   SMARD-API); die Filter-IDs für alle übrigen Energie-Metriken stehen fertig
   in SOURCE_METRIC_MAP bzw. SMARD_readme.md in wattfrosch-contracts.
@@ -50,24 +55,33 @@ nicht an diesem Modul.
   Abweichungen der API meldet fetch).
 
 ## Tech (Vorschlag)
-httpx, pydantic, tenacity, hishel, respx, uv
+httpx (sync), pydantic, pydantic-settings (Env-Präfix
+`WATTFROSCH_FETCH_`), tenacity, respx (nur Tests), uv.
+Caching: v1 aus, hishel als späteres Backend geplant.
 CLI: argparse (User-Entscheid gegen typer — keine neue Runtime-Dependency);
 Schalternamen müssen zu den anderen Modulen passen (`--metric` ist
 wiederholbar; Single-Value-Aufrufe sind eine Teilmenge).
 
-## Struktur (Vorschlag)
+## Struktur (real)
 src/wattfrosch_fetch/
-  http.py          # Basis-Layer: Retry, Backoff, Rate-Limit, Cache
-  clients/         # ein Modul je Datenquelle
-  normalize.py     # Rohdaten -> MeasurementRecord
+  contracts.py     # einzige Import-Stelle für alle Contract-Symbole
+  version.py       # Import-Zeit-Guard: assert_contract_version(CONTRACT_VERSION)
+  http.py          # Basis-Layer: Retry, Backoff, Rate-Limit (Cache aus, v1)
+  clients/         # ein Modul je Datenquelle + CLIENTS-Registry + create_client()
+  validity.py      # clamp_to_validity (Region-Gültigkeitsfenster)
+  conversions.py   # celsius_to_kelvin, kilometers_per_hour_to_meters_per_second
+  normalize.py     # leerer Stub — Normalisierung lebt in den Client-Modulen
+  export.py        # write_records: parquet/csv/ndjson via pyarrow
   cli.py
 tests/
-Dockerfile
 pyproject.toml
 
 ## Quickstart
 Abhängigkeit: wattfrosch-contracts >= 0.1.0 (getaggt und auf PyPI/wheel
-verfügbar; CONTRACT_VERSION kann für Kompatibilitätsprüfung importiert werden).
+verfügbar). Contract-Version-Guard: beim Import prüft version.py die
+CONTRACT_VERSION gegen `CONTRACT_VERSION_SUPPORTED` ("0.1", Major.Minor-
+Vergleich; Patch wird akzeptiert) und wirft sonst `ContractVersionError`
+(Fail fast beim Import).
 
 ```sh
 uv sync
@@ -109,8 +123,10 @@ leere Datei (nur Schema) geschrieben. Bei Endungs-Mismatch zwischen
 ## Fertig, wenn
 - Clients liefern valide MeasurementRecords
 - CLI exportiert nach Parquet/CSV/JSON
-- Tests grün (mit gemockten Antworten)
-- Dockerfile baut
+- Tests grün (mit gemockten Antworten, 100 % Coverage)
+- Dockerfile baut (OFFEN — noch nicht umgesetzt; Pfad-Abhängigkeit auf
+  wattfrosch-contracts funktioniert in einem Image so nicht und braucht
+  eine eigene Lösung)
 
 ## Quellenrollen und Fehlerverhalten
 Alle Quellen sind gleichrangig: `--source` entscheidet immer explizit; es
@@ -143,10 +159,13 @@ Die einheitliche Abrufsignatur bleibt `fetch_series(metric, region, start,
 end)`; das Batching mehrerer Metriken pro HTTP-Request passiert intern im
 Client.
 
-- **Open-Meteo**: keine Paginierung. Ein Request pro (Region, Fenster) über
-  `start_date`/`end_date`; alle angefragten stündlichen Variablen werden in
-  einem Call gebündelt (`hourly=a,b,c`). Kein clientseitiges Zerlegen des
-  Fensters in v1 (Payloads sind klein).
+- **Open-Meteo**: keine Paginierung, aber Fensteraufteilung in zwei Requests:
+  Archiv (ERA5, `archive-api.open-meteo.com`, `start_date`/`end_date`) für
+  `[start, heute - archive_lag_days)` und Forecast-Endpoint
+  (`api.open-meteo.com`) für den Rest (bis `heute + forecast_horizon_days`,
+  default 16 Tage). Überlappung 1 Tag; bei Duplikaten gewinnt der Archiv-Lauf
+  (spiegelt die `ON CONFLICT`-Idempotenz des Stores). Alle angefragten
+  stündlichen Variablen werden je Call gebündelt (`hourly=a,b,c`).
 - **Energy-Charts**: keine Paginierung. Ein Request pro (Region, Fenster)
   über `start`/`end` (ISO 8601 oder Unix-Sekunden); `/public_power` liefert
   alle Erzeugungs-/Verbrauchsarten in einem Call und wird intern je Metrik
@@ -156,6 +175,9 @@ Client.
   15-Minuten-Schritte (`/public_power` immer, `/price` aktuell; historische
   `/price`-Fenster stündlich) — fetch mittelt je UTC-Stunde auf PT1H;
   unvollständige Stunden (None-Schritt oder Gap) werden übersprungen.
+  Mehrere Metriken teilen sich per In-Run-Memoization die letzte Response
+  je (URL, Zone, Fenster) — bewusst kein HTTP-Caching, aber nötig, um unter
+  dem 2-Requests/Minute-Limit mehrere Metriken in einem Lauf zu holen.
   Quirks: `/price` verlangt die Zone UPPERCASE (`bzn=DE-LU`), die
   Gültigkeitsfenster der Regionen (DE-AT-LU/DE-LU ab 2018-10-01) erzwingt
   die API nicht — der Client klemmt das Fenster an `REGIONS`.
@@ -178,4 +200,7 @@ Ein leeres Ergebnis (z. B. Energy-Charts 404 „keine Daten im Zeitraum") ist
 kein Fehler: Exit 0 mit Warnung auf stderr.
 
 ## Offene Punkte (mit OpenCode erarbeiten)
-- (aktuell keine — alle Milestone-0-Entscheidungen sind getroffen)
+- Dockerfile (Pfad-Abhängigkeit auf wattfrosch-contracts braucht eine
+  Image-Lösung)
+- normalize.py ist ein leerer Stub; Normalisierung lebt in den Client-Modulen
+  (bewusst so entschieden — Stub später entfernen oder füllen)
