@@ -110,8 +110,10 @@ from wattfrosch_fetch.clients import create_client
 
 client = create_client("smard")
 records = client.fetch_series(
-    "consumption.load", "DE-LU",
-    datetime(2026, 10, 10, tzinfo=UTC), datetime(2026, 10, 12, tzinfo=UTC),
+    "consumption.load",
+    "DE-LU",
+    datetime(2026, 10, 10, tzinfo=UTC),
+    datetime(2026, 10, 12, tzinfo=UTC),
 )
 for record in records:
     print(record.ts_utc, record.metric, record.value)
